@@ -18,13 +18,19 @@ type SentinelMonitor struct {
 	mu            sync.RWMutex
 	currentMaster string
 
-	onChange func(newMaster string)
+	onChange func(oldMaster, newMaster string)
 
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	stopOnce sync.Once
+	stopCh   chan struct{}
+	wg       sync.WaitGroup
+
+	// connMu protects subConn/pollConn so Stop() can close them to unblock reads
+	connMu   sync.Mutex
+	subConn  net.Conn
+	pollConn net.Conn
 }
 
-func NewSentinelMonitor(sentinelAddr, masterName, auth string, onChange func(string)) *SentinelMonitor {
+func NewSentinelMonitor(sentinelAddr, masterName, auth string, onChange func(oldMaster, newMaster string)) *SentinelMonitor {
 	return &SentinelMonitor{
 		sentinelAddr: sentinelAddr,
 		masterName:   masterName,
@@ -49,7 +55,7 @@ func (sm *SentinelMonitor) setMaster(addr string) {
 	if old != addr {
 		log.Printf("master changed: %s -> %s", old, addr)
 		if sm.onChange != nil {
-			sm.onChange(addr)
+			sm.onChange(old, addr)
 		}
 	}
 }
@@ -61,7 +67,18 @@ func (sm *SentinelMonitor) Start() {
 }
 
 func (sm *SentinelMonitor) Stop() {
-	close(sm.stopCh)
+	sm.stopOnce.Do(func() {
+		close(sm.stopCh)
+		// Close active connections to unblock any pending reads
+		sm.connMu.Lock()
+		if sm.subConn != nil {
+			sm.subConn.Close()
+		}
+		if sm.pollConn != nil {
+			sm.pollConn.Close()
+		}
+		sm.connMu.Unlock()
+	})
 	sm.wg.Wait()
 }
 
@@ -98,7 +115,23 @@ func (sm *SentinelMonitor) queryMaster() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("dial sentinel: %w", err)
 	}
-	defer conn.Close()
+	defer func() {
+		sm.connMu.Lock()
+		sm.pollConn = nil
+		sm.connMu.Unlock()
+		conn.Close()
+	}()
+
+	sm.connMu.Lock()
+	select {
+	case <-sm.stopCh:
+		sm.connMu.Unlock()
+		return "", fmt.Errorf("stopped")
+	default:
+	}
+	sm.pollConn = conn
+	sm.connMu.Unlock()
+
 	conn.SetDeadline(time.Now().Add(3 * time.Second))
 
 	reader := NewRESPReader(conn)
@@ -135,6 +168,9 @@ func (sm *SentinelMonitor) queryMaster() (string, error) {
 
 	if resp.Type == TypeError {
 		return "", fmt.Errorf("sentinel error: %s", resp.Str)
+	}
+	if resp.IsNil {
+		return "", fmt.Errorf("master %q not found", sm.masterName)
 	}
 	if resp.Type != TypeArray || len(resp.Array) < 2 {
 		return "", fmt.Errorf("unexpected response type or length")
@@ -174,7 +210,27 @@ func (sm *SentinelMonitor) subscribe() error {
 	if err != nil {
 		return fmt.Errorf("dial sentinel: %w", err)
 	}
-	defer conn.Close()
+	defer func() {
+		sm.connMu.Lock()
+		sm.subConn = nil
+		sm.connMu.Unlock()
+		conn.Close()
+	}()
+
+	// Register conn so Stop() can close it to unblock reads.
+	// Check stopCh first to bail out immediately if stop was called during dial.
+	sm.connMu.Lock()
+	select {
+	case <-sm.stopCh:
+		sm.connMu.Unlock()
+		return nil
+	default:
+	}
+	sm.subConn = conn
+	sm.connMu.Unlock()
+
+	// Set deadline for setup phase (AUTH + SUBSCRIBE ack)
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	reader := NewRESPReader(conn)
 	writer := NewRESPWriter(conn)
@@ -202,10 +258,20 @@ func (sm *SentinelMonitor) subscribe() error {
 		return fmt.Errorf("flush: %w", err)
 	}
 
-	// Read subscription acknowledgment
-	if _, err := reader.ReadValue(); err != nil {
+	// Read and validate subscription acknowledgment
+	ack, err := reader.ReadValue()
+	if err != nil {
 		return fmt.Errorf("read subscribe ack: %w", err)
 	}
+	if ack.Type == TypeError {
+		return fmt.Errorf("subscribe rejected: %s", ack.Str)
+	}
+	if ack.Type != TypeArray || len(ack.Array) < 1 || strings.ToLower(ack.Array[0].Str) != "subscribe" {
+		return fmt.Errorf("unexpected subscribe ack: type=%c", ack.Type)
+	}
+
+	// Clear deadline for message loop (we use per-read deadlines below)
+	conn.SetDeadline(time.Time{})
 
 	// Read messages until error or stop
 	for {

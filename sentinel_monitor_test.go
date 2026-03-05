@@ -154,7 +154,7 @@ func TestSentinelMonitorPoll(t *testing.T) {
 
 	var mu sync.Mutex
 	var lastMaster string
-	onChange := func(addr string) {
+	onChange := func(oldMaster, addr string) {
 		mu.Lock()
 		lastMaster = addr
 		mu.Unlock()
@@ -184,7 +184,7 @@ func TestSentinelMonitorMasterChange(t *testing.T) {
 	fs := startFakeSentinel(t, "mymaster", "10.0.0.1", "6379", "")
 
 	changes := make(chan string, 10)
-	sm := NewSentinelMonitor(fs.Addr(), "mymaster", "", func(addr string) {
+	sm := NewSentinelMonitor(fs.Addr(), "mymaster", "", func(_, addr string) {
 		changes <- addr
 	})
 	sm.Start()
@@ -218,7 +218,7 @@ func TestSentinelMonitorWithAuth(t *testing.T) {
 	fs := startFakeSentinel(t, "mymaster", "10.0.0.5", "6379", "sentinelpass")
 
 	changes := make(chan string, 10)
-	sm := NewSentinelMonitor(fs.Addr(), "mymaster", "sentinelpass", func(addr string) {
+	sm := NewSentinelMonitor(fs.Addr(), "mymaster", "sentinelpass", func(_, addr string) {
 		changes <- addr
 	})
 	sm.Start()
@@ -238,7 +238,7 @@ func TestSentinelMonitorSubscription(t *testing.T) {
 	fs := startFakeSentinel(t, "mymaster", "10.0.0.1", "6379", "")
 
 	changes := make(chan string, 10)
-	sm := NewSentinelMonitor(fs.Addr(), "mymaster", "", func(addr string) {
+	sm := NewSentinelMonitor(fs.Addr(), "mymaster", "", func(_, addr string) {
 		changes <- addr
 	})
 	sm.Start()
@@ -274,7 +274,7 @@ func TestSentinelMonitorSetMasterNoChangeNoDuplicate(t *testing.T) {
 	var mu sync.Mutex
 
 	sm := &SentinelMonitor{
-		onChange: func(addr string) {
+		onChange: func(_, addr string) {
 			mu.Lock()
 			callCount++
 			mu.Unlock()
@@ -307,5 +307,178 @@ func TestSentinelMonitorStopClean(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("Stop() did not return in time")
+	}
+}
+
+func TestSentinelMonitorStopIdempotent(t *testing.T) {
+	sm := NewSentinelMonitor("127.0.0.1:1", "mymaster", "", nil)
+	sm.Start()
+	sm.Stop()
+	// Second stop should not panic
+	sm.Stop()
+}
+
+// Test that Stop() returns promptly even when sentinel accepts TCP but never replies.
+func TestSentinelMonitorStopWithHangingSentinel(t *testing.T) {
+	// Start a listener that accepts connections but never sends anything
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Hold the connection open but never respond
+			go func() {
+				buf := make([]byte, 4096)
+				for {
+					_, err := conn.Read(buf)
+					if err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+
+	sm := NewSentinelMonitor(ln.Addr().String(), "mymaster", "", nil)
+	sm.Start()
+
+	// Give it time to connect
+	time.Sleep(500 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() {
+		sm.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop() blocked too long with hanging sentinel")
+	}
+}
+
+func TestSentinelMonitorSubscribeRejected(t *testing.T) {
+	// Start a sentinel that rejects SUBSCRIBE
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				reader := NewRESPReader(conn)
+				writer := NewRESPWriter(conn)
+				for {
+					val, err := reader.ReadValue()
+					if err != nil {
+						return
+					}
+					args := val.ToArgs()
+					if len(args) == 0 {
+						continue
+					}
+					switch strings.ToUpper(args[0]) {
+					case "SUBSCRIBE":
+						writer.WriteError("ERR operation not permitted")
+						writer.Flush()
+						return
+					case "SENTINEL":
+						writer.WriteNullArray()
+						writer.Flush()
+					}
+				}
+			}()
+		}
+	}()
+
+	sm := NewSentinelMonitor(ln.Addr().String(), "mymaster", "", nil)
+	err = sm.subscribe()
+	if err == nil {
+		t.Fatal("expected error from rejected SUBSCRIBE")
+	}
+	if !strings.Contains(err.Error(), "subscribe rejected") {
+		t.Fatalf("expected 'subscribe rejected' error, got: %v", err)
+	}
+}
+
+// fakeSentinelNullMaster returns null array for the master query.
+type fakeSentinelNullMaster struct {
+	listener net.Listener
+}
+
+func startFakeSentinelNullMaster(t *testing.T) *fakeSentinelNullMaster {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := &fakeSentinelNullMaster{listener: ln}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				reader := NewRESPReader(conn)
+				writer := NewRESPWriter(conn)
+				for {
+					val, err := reader.ReadValue()
+					if err != nil {
+						return
+					}
+					args := val.ToArgs()
+					if len(args) >= 3 && strings.ToUpper(args[0]) == "SENTINEL" {
+						writer.WriteNullArray()
+						writer.Flush()
+					} else if strings.ToUpper(args[0]) == "SUBSCRIBE" {
+						for i, ch := range args[1:] {
+							writer.WriteArrayHeader(3)
+							writer.WriteBulkString("subscribe")
+							writer.WriteBulkString(ch)
+							writer.WriteInteger(int64(i + 1))
+						}
+						writer.Flush()
+						// Block
+						buf := make([]byte, 1)
+						conn.Read(buf)
+						return
+					}
+				}
+			}()
+		}
+	}()
+	return fs
+}
+
+func TestSentinelMonitorNullMasterResponse(t *testing.T) {
+	fs := startFakeSentinelNullMaster(t)
+
+	sm := NewSentinelMonitor(fs.listener.Addr().String(), "mymaster", "", nil)
+
+	// queryMaster should return error for null response
+	_, err := sm.queryMaster()
+	if err == nil {
+		t.Fatal("expected error for null master response")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected 'not found' error, got: %v", err)
 	}
 }

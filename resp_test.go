@@ -304,7 +304,6 @@ func TestRESPWriterRawMessage(t *testing.T) {
 }
 
 func TestRESPRoundTrip(t *testing.T) {
-	// Write a complex value, then read it back
 	var buf bytes.Buffer
 	w := NewRESPWriter(&buf)
 	w.WriteArrayHeader(3)
@@ -389,5 +388,140 @@ func TestRESPReaderBulkStringWithBinaryData(t *testing.T) {
 	}
 	if val.Str != data {
 		t.Fatalf("expected %q, got %q", data, val.Str)
+	}
+}
+
+// --- Issue #1: negative lengths must not panic ---
+
+func TestRESPReaderNegativeBulkStringLength(t *testing.T) {
+	tests := []string{"$-2\r\n", "$-3\r\n", "$-100\r\n"}
+	for _, input := range tests {
+		r := NewRESPReader(strings.NewReader(input))
+		_, err := r.ReadValue()
+		if err == nil {
+			t.Fatalf("expected error for %q, got nil", input)
+		}
+	}
+}
+
+func TestRESPReaderNegativeArrayLength(t *testing.T) {
+	tests := []string{"*-2\r\n", "*-3\r\n", "*-100\r\n"}
+	for _, input := range tests {
+		r := NewRESPReader(strings.NewReader(input))
+		_, err := r.ReadValue()
+		if err == nil {
+			t.Fatalf("expected error for %q, got nil", input)
+		}
+	}
+}
+
+func TestRESPReaderHugeBulkStringLength(t *testing.T) {
+	r := NewRESPReader(strings.NewReader("$999999999999\r\n"))
+	_, err := r.ReadValue()
+	if err == nil {
+		t.Fatal("expected error for huge bulk string length")
+	}
+}
+
+func TestRESPReaderHugeArrayLength(t *testing.T) {
+	r := NewRESPReader(strings.NewReader("*999999999999\r\n"))
+	_, err := r.ReadValue()
+	if err == nil {
+		t.Fatal("expected error for huge array length")
+	}
+}
+
+// --- Issue #10: bulk string framing validation ---
+
+func TestRESPReaderLineTooLong(t *testing.T) {
+	// Build a simple string line that exceeds maxLineLength (64KB)
+	long := "+" + strings.Repeat("x", 65*1024) + "\r\n"
+	r := NewRESPReader(strings.NewReader(long))
+	_, err := r.ReadValue()
+	if err == nil {
+		t.Fatal("expected error for oversized line")
+	}
+	if !strings.Contains(err.Error(), "line length exceeds maximum") {
+		t.Fatalf("expected line length error, got: %v", err)
+	}
+}
+
+func TestRESPReaderBulkStringExceedsLimit(t *testing.T) {
+	// Bulk string exceeding 64 KiB limit should fail
+	r := NewRESPReader(strings.NewReader("$65537\r\n"))
+	_, err := r.ReadValue()
+	if err == nil {
+		t.Fatal("expected error for bulk string exceeding 64 KiB")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("expected exceeds maximum error, got: %v", err)
+	}
+}
+
+func TestRESPReaderBulkStringBadTerminator(t *testing.T) {
+	// 5 bytes of data but wrong terminator
+	r := NewRESPReader(strings.NewReader("$5\r\nhelloXX"))
+	_, err := r.ReadValue()
+	if err == nil {
+		t.Fatal("expected error for bad bulk string terminator")
+	}
+}
+
+func TestRESPReaderDeepNestingRejected(t *testing.T) {
+	// Build a deeply nested array: *1\r\n repeated 33+ times then +OK\r\n
+	var input string
+	for i := 0; i < 34; i++ {
+		input += "*1\r\n"
+	}
+	input += "+OK\r\n"
+
+	r := NewRESPReader(strings.NewReader(input))
+	_, err := r.ReadValue()
+	if err == nil {
+		t.Fatal("expected error for deep nesting")
+	}
+	if !strings.Contains(err.Error(), "nesting depth") {
+		t.Fatalf("expected nesting depth error, got: %v", err)
+	}
+}
+
+func TestRESPReaderNestingWithinLimit(t *testing.T) {
+	// 3 levels of nesting should be fine
+	input := "*1\r\n*1\r\n*1\r\n+OK\r\n"
+	r := NewRESPReader(strings.NewReader(input))
+	val, err := r.ReadValue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val.Type != TypeArray || len(val.Array) != 1 {
+		t.Fatal("expected outer array of 1")
+	}
+}
+
+func TestRESPReaderBareLFRejected(t *testing.T) {
+	// Bare \n without \r should be rejected
+	r := NewRESPReader(strings.NewReader("+OK\n"))
+	_, err := r.ReadValue()
+	if err == nil {
+		t.Fatal("expected error for bare \\n")
+	}
+	if !strings.Contains(err.Error(), "bare \\n") {
+		t.Fatalf("expected bare \\n error, got: %v", err)
+	}
+}
+
+func TestRESPReaderBareLFInBulkStringLength(t *testing.T) {
+	r := NewRESPReader(strings.NewReader("$5\nhello\r\n"))
+	_, err := r.ReadValue()
+	if err == nil {
+		t.Fatal("expected error for bare \\n in bulk string length")
+	}
+}
+
+func TestRESPReaderBareLFInInlineCommand(t *testing.T) {
+	r := NewRESPReader(strings.NewReader("PING\n"))
+	_, err := r.ReadValue()
+	if err == nil {
+		t.Fatal("expected error for bare \\n in inline command")
 	}
 }

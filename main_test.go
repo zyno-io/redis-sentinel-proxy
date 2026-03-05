@@ -29,15 +29,3 @@ func TestEnvOrDefault(t *testing.T) {
 	}
 }
 
-func TestDetectOutboundIP(t *testing.T) {
-	ip, err := detectOutboundIP()
-	if err != nil {
-		t.Skipf("cannot detect outbound IP (no network?): %v", err)
-	}
-	if ip == "" {
-		t.Fatal("detected empty IP")
-	}
-	if ip == "127.0.0.1" {
-		t.Fatal("detected loopback")
-	}
-}

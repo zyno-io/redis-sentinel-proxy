@@ -1,11 +1,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"strings"
 	"sync"
+	"time"
 )
 
 // SentinelEmulator emulates a Redis Sentinel for downstream clients.
@@ -18,7 +20,9 @@ type SentinelEmulator struct {
 	listener net.Listener
 
 	mu          sync.Mutex
-	subscribers map[net.Conn]struct{}
+	conns       map[net.Conn]struct{}
+	subscribers map[net.Conn]*sync.Mutex // per-conn write mutex
+	stopping    bool
 
 	wg sync.WaitGroup
 }
@@ -29,7 +33,8 @@ func NewSentinelEmulator(listenAddr, masterName, announceIP, announcePort string
 		masterName:   masterName,
 		announceIP:   announceIP,
 		announcePort: announcePort,
-		subscribers:  make(map[net.Conn]struct{}),
+		conns:        make(map[net.Conn]struct{}),
+		subscribers:  make(map[net.Conn]*sync.Mutex),
 	}
 }
 
@@ -51,8 +56,10 @@ func (se *SentinelEmulator) Stop() {
 		se.listener.Close()
 	}
 
+	// Mark as stopping and close all tracked connections
 	se.mu.Lock()
-	for conn := range se.subscribers {
+	se.stopping = true
+	for conn := range se.conns {
 		conn.Close()
 	}
 	se.mu.Unlock()
@@ -60,24 +67,62 @@ func (se *SentinelEmulator) Stop() {
 	se.wg.Wait()
 }
 
+// trackConn registers a connection. Returns false if the emulator is stopping,
+// in which case the connection is closed immediately.
+func (se *SentinelEmulator) trackConn(conn net.Conn) bool {
+	se.mu.Lock()
+	defer se.mu.Unlock()
+	if se.stopping {
+		conn.Close()
+		return false
+	}
+	se.conns[conn] = struct{}{}
+	return true
+}
+
+func (se *SentinelEmulator) untrackConn(conn net.Conn) {
+	se.mu.Lock()
+	delete(se.conns, conn)
+	delete(se.subscribers, conn)
+	se.mu.Unlock()
+}
+
 func (se *SentinelEmulator) acceptLoop() {
 	defer se.wg.Done()
 
+	var backoff time.Duration
 	for {
 		conn, err := se.listener.Accept()
 		if err != nil {
-			return // listener closed
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if backoff == 0 {
+				backoff = 5 * time.Millisecond
+			} else {
+				backoff *= 2
+				if backoff > time.Second {
+					backoff = time.Second
+				}
+			}
+			log.Printf("sentinel accept error (retrying in %v): %v", backoff, err)
+			time.Sleep(backoff)
+			continue
 		}
+		backoff = 0
+		if !se.trackConn(conn) {
+			continue
+		}
+		se.wg.Add(1)
 		go se.handleConn(conn)
 	}
 }
 
 func (se *SentinelEmulator) handleConn(conn net.Conn) {
 	defer func() {
-		se.mu.Lock()
-		delete(se.subscribers, conn)
-		se.mu.Unlock()
+		se.untrackConn(conn)
 		conn.Close()
+		se.wg.Done()
 	}()
 
 	reader := NewRESPReader(conn)
@@ -96,43 +141,55 @@ func (se *SentinelEmulator) handleConn(conn net.Conn) {
 
 		cmd := strings.ToUpper(args[0])
 
+		var cmdErr error
 		switch cmd {
 		case "PING":
-			writer.WriteSimpleString("PONG")
-			writer.Flush()
+			if err := writer.WriteSimpleString("PONG"); err != nil {
+				return
+			}
+			cmdErr = writer.Flush()
 
 		case "AUTH":
 			// Accept any auth for the emulator
-			writer.WriteSimpleString("OK")
-			writer.Flush()
+			if err := writer.WriteSimpleString("OK"); err != nil {
+				return
+			}
+			cmdErr = writer.Flush()
 
 		case "SENTINEL":
-			se.handleSentinelCmd(writer, args[1:])
+			cmdErr = se.handleSentinelCmd(writer, args[1:])
 
 		case "SUBSCRIBE":
-			se.handleSubscribe(conn, writer, args[1:])
+			se.handleSubscribe(conn, reader, writer, args[1:])
 			return // connection is now in pub/sub mode
 
 		case "INFO":
-			se.handleInfo(writer, args[1:])
+			cmdErr = se.handleInfo(writer, args[1:])
 
 		case "CLIENT":
 			// Handle CLIENT SETNAME, CLIENT GETNAME, etc.
-			writer.WriteSimpleString("OK")
-			writer.Flush()
+			if err := writer.WriteSimpleString("OK"); err != nil {
+				return
+			}
+			cmdErr = writer.Flush()
 
 		default:
-			writer.WriteError("ERR unknown command '" + args[0] + "'")
-			writer.Flush()
+			if err := writer.WriteError("ERR unknown command '" + args[0] + "'"); err != nil {
+				return
+			}
+			cmdErr = writer.Flush()
+		}
+
+		if cmdErr != nil {
+			return
 		}
 	}
 }
 
-func (se *SentinelEmulator) handleSentinelCmd(writer *RESPWriter, args []string) {
+func (se *SentinelEmulator) handleSentinelCmd(writer *RESPWriter, args []string) error {
 	if len(args) == 0 {
 		writer.WriteError("ERR wrong number of arguments for 'sentinel' command")
-		writer.Flush()
-		return
+		return writer.Flush()
 	}
 
 	subcmd := strings.ToUpper(args[0])
@@ -141,16 +198,14 @@ func (se *SentinelEmulator) handleSentinelCmd(writer *RESPWriter, args []string)
 	case "GET-MASTER-ADDR-BY-NAME":
 		if len(args) < 2 {
 			writer.WriteError("ERR wrong number of arguments for 'sentinel get-master-addr-by-name' command")
-			writer.Flush()
-			return
+			return writer.Flush()
 		}
 		if args[1] != se.masterName {
 			writer.WriteNullArray()
-			writer.Flush()
-			return
+			return writer.Flush()
 		}
 		writer.WriteBulkStringArray([]string{se.announceIP, se.announcePort})
-		writer.Flush()
+		return writer.Flush()
 
 	case "MASTERS":
 		// Return a single master entry
@@ -165,49 +220,75 @@ func (se *SentinelEmulator) handleSentinelCmd(writer *RESPWriter, args []string)
 		}
 		writer.WriteArrayHeader(1)
 		writer.WriteBulkStringArray(masterInfo)
-		writer.Flush()
+		return writer.Flush()
 
 	case "SENTINELS":
 		// Return empty array
 		writer.WriteArrayHeader(0)
-		writer.Flush()
+		return writer.Flush()
 
 	case "SLAVES", "REPLICAS":
 		// Return empty array
 		writer.WriteArrayHeader(0)
-		writer.Flush()
+		return writer.Flush()
 
 	default:
-		writer.WriteError("ERR Unknown sentinel subcommand '" + args[0] + "'")
-		writer.Flush()
+		writer.WriteError("ERR NOTIMPLEMENTED sentinel subcommand '" + args[0] + "'")
+		return writer.Flush()
 	}
 }
 
-func (se *SentinelEmulator) handleSubscribe(conn net.Conn, writer *RESPWriter, channels []string) {
+func (se *SentinelEmulator) handleSubscribe(conn net.Conn, reader *RESPReader, writer *RESPWriter, channels []string) {
+	if len(channels) == 0 {
+		writer.WriteError("ERR wrong number of arguments for 'subscribe' command")
+		writer.Flush()
+		return
+	}
+
 	for i, ch := range channels {
 		writer.WriteArrayHeader(3)
 		writer.WriteBulkString("subscribe")
 		writer.WriteBulkString(ch)
 		writer.WriteInteger(int64(i + 1))
-		writer.Flush()
+		if err := writer.Flush(); err != nil {
+			return
+		}
 	}
 
-	// Register as subscriber
+	// Register as subscriber with a per-connection write mutex
+	writeMu := &sync.Mutex{}
 	se.mu.Lock()
-	se.subscribers[conn] = struct{}{}
+	se.subscribers[conn] = writeMu
 	se.mu.Unlock()
 
-	// Keep connection alive - read until error
-	reader := NewRESPReader(conn)
+	// Keep connection alive - read until error (reuse existing reader to avoid losing buffered data)
 	for {
-		_, err := reader.ReadValue()
+		val, err := reader.ReadValue()
 		if err != nil {
 			return
+		}
+
+		// Handle PING in pub/sub mode: respond with ["pong", <msg>]
+		args := val.ToArgs()
+		if len(args) > 0 && strings.ToUpper(args[0]) == "PING" {
+			msg := ""
+			if len(args) > 1 {
+				msg = args[1]
+			}
+			writeMu.Lock()
+			writer.WriteArrayHeader(2)
+			writer.WriteBulkString("pong")
+			writer.WriteBulkString(msg)
+			err = writer.Flush()
+			writeMu.Unlock()
+			if err != nil {
+				return
+			}
 		}
 	}
 }
 
-func (se *SentinelEmulator) handleInfo(writer *RESPWriter, args []string) {
+func (se *SentinelEmulator) handleInfo(writer *RESPWriter, args []string) error {
 	section := ""
 	if len(args) > 0 {
 		section = strings.ToLower(args[0])
@@ -224,30 +305,48 @@ func (se *SentinelEmulator) handleInfo(writer *RESPWriter, args []string) {
 	}
 
 	writer.WriteBulkString(info)
-	writer.Flush()
+	return writer.Flush()
 }
 
 // BroadcastSwitchMaster sends a +switch-master message to all subscribed clients.
-func (se *SentinelEmulator) BroadcastSwitchMaster(oldIP, oldPort, newIP, newPort string) {
-	payload := fmt.Sprintf("%s %s %s %s %s", se.masterName, oldIP, oldPort, newIP, newPort)
+// oldMaster is the previous upstream master address (host:port). The "new" fields
+// use the proxy's announce address so clients reconnect through the proxy.
+func (se *SentinelEmulator) BroadcastSwitchMaster(oldMaster string) {
+	oldHost, oldPort, err := net.SplitHostPort(oldMaster)
+	if err != nil || oldHost == "" {
+		oldHost = "0.0.0.0"
+		oldPort = "0"
+	}
+	payload := fmt.Sprintf("%s %s %s %s %s",
+		se.masterName, oldHost, oldPort, se.announceIP, se.announcePort)
 
 	se.mu.Lock()
-	subscribers := make([]net.Conn, 0, len(se.subscribers))
-	for conn := range se.subscribers {
-		subscribers = append(subscribers, conn)
+	type sub struct {
+		conn    net.Conn
+		writeMu *sync.Mutex
+	}
+	subs := make([]sub, 0, len(se.subscribers))
+	for conn, mu := range se.subscribers {
+		subs = append(subs, sub{conn, mu})
 	}
 	se.mu.Unlock()
 
-	for _, conn := range subscribers {
-		writer := NewRESPWriter(conn)
+	for _, s := range subs {
+		s.writeMu.Lock()
+		s.conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+		writer := NewRESPWriter(s.conn)
 		writer.WriteArrayHeader(3)
 		writer.WriteBulkString("message")
 		writer.WriteBulkString("+switch-master")
 		writer.WriteBulkString(payload)
-		if err := writer.Flush(); err != nil {
-			conn.Close()
+		err := writer.Flush()
+		s.conn.SetWriteDeadline(time.Time{})
+		s.writeMu.Unlock()
+
+		if err != nil {
+			s.conn.Close()
 			se.mu.Lock()
-			delete(se.subscribers, conn)
+			delete(se.subscribers, s.conn)
 			se.mu.Unlock()
 		}
 	}

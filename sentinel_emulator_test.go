@@ -3,6 +3,7 @@ package main
 import (
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -121,7 +122,6 @@ func TestEmulatorMasters(t *testing.T) {
 	if inner.Type != TypeArray {
 		t.Fatal("expected inner array")
 	}
-	// Check key-value pairs
 	m := make(map[string]string)
 	for i := 0; i+1 < len(inner.Array); i += 2 {
 		m[inner.Array[i].Str] = inner.Array[i+1].Str
@@ -261,8 +261,8 @@ func TestEmulatorUnknownCommand(t *testing.T) {
 	if val.Type != TypeError {
 		t.Fatalf("expected error, got %c %q", val.Type, val.Str)
 	}
-	if !strings.Contains(val.Str, "unknown command") {
-		t.Fatalf("expected unknown command error, got %q", val.Str)
+	if !strings.Contains(val.Str, "ERR unknown command") {
+		t.Fatalf("expected ERR unknown command error, got %q", val.Str)
 	}
 }
 
@@ -313,12 +313,10 @@ func TestEmulatorGetMasterAddrByNameNoName(t *testing.T) {
 
 func TestEmulatorSubscribe(t *testing.T) {
 	_, addr := startTestEmulator(t)
-	conn, r, w := dialEmulator(t, addr)
-	_ = conn
+	_, r, w := dialEmulator(t, addr)
 
 	sendCommand(t, w, "SUBSCRIBE", "+switch-master")
 
-	// Read subscription acknowledgment
 	val, err := r.ReadValue()
 	if err != nil {
 		t.Fatal(err)
@@ -337,13 +335,27 @@ func TestEmulatorSubscribe(t *testing.T) {
 	}
 }
 
+func TestEmulatorSubscribeZeroChannels(t *testing.T) {
+	_, addr := startTestEmulator(t)
+	_, r, w := dialEmulator(t, addr)
+
+	sendCommand(t, w, "SUBSCRIBE")
+
+	val, err := r.ReadValue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val.Type != TypeError {
+		t.Fatalf("expected error for SUBSCRIBE with no channels, got %c %q", val.Type, val.Str)
+	}
+}
+
 func TestEmulatorBroadcastSwitchMaster(t *testing.T) {
 	se, addr := startTestEmulator(t)
 	_, r, w := dialEmulator(t, addr)
 
 	// Subscribe
 	sendCommand(t, w, "SUBSCRIBE", "+switch-master")
-	// Read ack
 	if _, err := r.ReadValue(); err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +364,7 @@ func TestEmulatorBroadcastSwitchMaster(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Broadcast a switch-master event
-	se.BroadcastSwitchMaster("10.0.0.1", "6379", "10.0.0.2", "6380")
+	se.BroadcastSwitchMaster("10.0.0.99:6379")
 
 	// Read the broadcast message
 	val, err := r.ReadValue()
@@ -369,14 +381,47 @@ func TestEmulatorBroadcastSwitchMaster(t *testing.T) {
 		t.Fatalf("expected '+switch-master', got %q", val.Array[1].Str)
 	}
 	payload := val.Array[2].Str
-	if !strings.Contains(payload, "mymaster") {
-		t.Fatalf("expected master name in payload, got %q", payload)
+	// Payload format: "<master-name> <old-ip> <old-port> <new-ip> <new-port>"
+	expected := "mymaster 10.0.0.99 6379 10.0.0.1 6379"
+	if payload != expected {
+		t.Fatalf("expected payload %q, got %q", expected, payload)
 	}
-	if !strings.Contains(payload, "10.0.0.2") {
-		t.Fatalf("expected new IP in payload, got %q", payload)
+}
+
+func TestEmulatorBroadcastConcurrent(t *testing.T) {
+	se, addr := startTestEmulator(t)
+	_, r, w := dialEmulator(t, addr)
+
+	sendCommand(t, w, "SUBSCRIBE", "+switch-master")
+	if _, err := r.ReadValue(); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(payload, "6380") {
-		t.Fatalf("expected new port in payload, got %q", payload)
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Concurrent broadcasts should not cause race conditions or corrupted frames
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			se.BroadcastSwitchMaster("10.0.0.99:6379")
+		}()
+	}
+	wg.Wait()
+
+	// Read all 10 messages and verify they're valid
+	for i := 0; i < 10; i++ {
+		val, err := r.ReadValue()
+		if err != nil {
+			t.Fatalf("message %d: %v", i, err)
+		}
+		if val.Type != TypeArray || len(val.Array) != 3 {
+			t.Fatalf("message %d: expected array of 3, got type=%c len=%d", i, val.Type, len(val.Array))
+		}
+		if val.Array[0].Str != "message" {
+			t.Fatalf("message %d: expected 'message', got %q", i, val.Array[0].Str)
+		}
 	}
 }
 
@@ -384,7 +429,6 @@ func TestEmulatorMultipleCommands(t *testing.T) {
 	_, addr := startTestEmulator(t)
 	_, r, w := dialEmulator(t, addr)
 
-	// Send multiple commands on the same connection
 	sendCommand(t, w, "PING")
 	val, err := r.ReadValue()
 	if err != nil {
@@ -410,5 +454,118 @@ func TestEmulatorMultipleCommands(t *testing.T) {
 	}
 	if !strings.Contains(val.Str, "sentinel_masters") {
 		t.Fatalf("expected info, got %q", val.Str)
+	}
+}
+
+func TestEmulatorPubSubPing(t *testing.T) {
+	_, addr := startTestEmulator(t)
+	_, r, w := dialEmulator(t, addr)
+
+	// Subscribe first
+	sendCommand(t, w, "SUBSCRIBE", "+switch-master")
+	if _, err := r.ReadValue(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Send PING in pub/sub mode (no message)
+	sendCommand(t, w, "PING")
+	val, err := r.ReadValue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val.Type != TypeArray || len(val.Array) != 2 {
+		t.Fatalf("expected array of 2, got type=%c len=%d", val.Type, len(val.Array))
+	}
+	if val.Array[0].Str != "pong" {
+		t.Fatalf("expected 'pong', got %q", val.Array[0].Str)
+	}
+	if val.Array[1].Str != "" {
+		t.Fatalf("expected empty message, got %q", val.Array[1].Str)
+	}
+
+	// Send PING with a message
+	sendCommand(t, w, "PING", "hello")
+	val, err = r.ReadValue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val.Type != TypeArray || len(val.Array) != 2 {
+		t.Fatalf("expected array of 2, got type=%c len=%d", val.Type, len(val.Array))
+	}
+	if val.Array[0].Str != "pong" {
+		t.Fatalf("expected 'pong', got %q", val.Array[0].Str)
+	}
+	if val.Array[1].Str != "hello" {
+		t.Fatalf("expected 'hello', got %q", val.Array[1].Str)
+	}
+}
+
+func TestEmulatorStopIdempotent(t *testing.T) {
+	se := NewSentinelEmulator("127.0.0.1:0", "mymaster", "10.0.0.1", "6379")
+	if err := se.Start(); err != nil {
+		t.Fatal(err)
+	}
+	se.Stop()
+	// Second stop should not panic
+	se.Stop()
+}
+
+func TestEmulatorBroadcastSwitchMasterEmptyOld(t *testing.T) {
+	se, addr := startTestEmulator(t)
+	_, r, w := dialEmulator(t, addr)
+
+	sendCommand(t, w, "SUBSCRIBE", "+switch-master")
+	if _, err := r.ReadValue(); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Broadcast with empty old master (initial discovery)
+	se.BroadcastSwitchMaster("")
+
+	val, err := r.ReadValue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := val.Array[2].Str
+	// Should use 0.0.0.0:0 as fallback for old address
+	expected := "mymaster 0.0.0.0 0 10.0.0.1 6379"
+	if payload != expected {
+		t.Fatalf("expected payload %q, got %q", expected, payload)
+	}
+}
+
+func TestEmulatorStopClosesActiveConnections(t *testing.T) {
+	se := NewSentinelEmulator("127.0.0.1:0", "mymaster", "10.0.0.1", "6379")
+	if err := se.Start(); err != nil {
+		t.Fatal(err)
+	}
+	addr := se.listener.Addr().String()
+
+	// Open a connection and send a command to ensure it's being handled
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	w := NewRESPWriter(conn)
+	r := NewRESPReader(conn)
+	sendCommand(t, w, "PING")
+	if _, err := r.ReadValue(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stop should close the connection and not hang
+	done := make(chan struct{})
+	go func() {
+		se.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop() did not return in time")
 	}
 }

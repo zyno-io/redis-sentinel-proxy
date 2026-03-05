@@ -3,6 +3,7 @@ package main
 import (
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -159,19 +160,19 @@ func TestProxyWithBadAuth(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Connection should close because upstream auth fails
-	conn.SetReadDeadline(time.Now().Add(time.Second))
-	buf := make([]byte, 1)
-	_, err = conn.Read(buf)
-	if err != io.EOF && err != io.ErrUnexpectedEOF {
-		// Could also be a timeout or connection reset - all indicate the proxy dropped us
-		if ne, ok := err.(net.Error); ok && ne.Timeout() {
-			// Acceptable - proxy closed before we read
-		} else if err != nil {
-			// Some other error is also fine - connection was closed
-		} else {
-			t.Fatal("expected connection to be closed due to auth failure")
-		}
+	// Proxy should send a RESP error before closing
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	r := NewRESPReader(conn)
+	val, err := r.ReadValue()
+	if err != nil {
+		// Connection closed before we could read - also acceptable
+		return
+	}
+	if val.Type != TypeError {
+		t.Fatalf("expected error response, got %c %q", val.Type, val.Str)
+	}
+	if !strings.Contains(val.Str, "auth failed") {
+		t.Fatalf("expected auth failed error, got %q", val.Str)
 	}
 }
 
@@ -190,12 +191,19 @@ func TestProxyNoMaster(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Connection should close because no master is available
-	conn.SetReadDeadline(time.Now().Add(time.Second))
-	buf := make([]byte, 1)
-	_, err = conn.Read(buf)
-	if err == nil {
-		t.Fatal("expected connection to be closed")
+	// Proxy should send a RESP error before closing
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	r := NewRESPReader(conn)
+	val, err := r.ReadValue()
+	if err != nil {
+		// Connection closed - also acceptable
+		return
+	}
+	if val.Type != TypeError {
+		t.Fatalf("expected error response, got %c %q", val.Type, val.Str)
+	}
+	if !strings.Contains(val.Str, "no master") {
+		t.Fatalf("expected no master error, got %q", val.Str)
 	}
 }
 
@@ -291,11 +299,77 @@ func TestProxyUpstreamUnreachable(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Connection should close because upstream is unreachable
+	// Proxy should send a RESP error before closing
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	buf := make([]byte, 1)
-	_, err = conn.Read(buf)
-	if err == nil {
-		t.Fatal("expected connection to be closed")
+	r := NewRESPReader(conn)
+	val, err := r.ReadValue()
+	if err != nil {
+		// Connection closed - also acceptable
+		return
+	}
+	if val.Type != TypeError {
+		t.Fatalf("expected error response, got %c %q", val.Type, val.Str)
+	}
+	if !strings.Contains(val.Str, "upstream unavailable") {
+		t.Fatalf("expected upstream unavailable error, got %q", val.Str)
+	}
+}
+
+func TestProxyStopIdempotent(t *testing.T) {
+	fakeAddr, _ := startFakeRedis(t, "")
+	proxy := NewRedisProxy("127.0.0.1:0", "", func() string { return fakeAddr })
+	if err := proxy.Start(); err != nil {
+		t.Fatal(err)
+	}
+	proxy.Stop()
+	// Second stop should not panic
+	proxy.Stop()
+}
+
+func TestProxyStopDrainsConnections(t *testing.T) {
+	fakeAddr, _ := startFakeRedis(t, "")
+	proxy := NewRedisProxy("127.0.0.1:0", "", func() string { return fakeAddr })
+	if err := proxy.Start(); err != nil {
+		t.Fatal(err)
+	}
+	proxyAddr := proxy.listener.Addr().String()
+
+	// Open a connection and verify it works
+	conn, err := net.DialTimeout("tcp", proxyAddr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	r := NewRESPReader(conn)
+	w := NewRESPWriter(conn)
+	w.WriteBulkStringArray([]string{"PING"})
+	w.Flush()
+	val, err := r.ReadValue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val.Str != "PONG" {
+		t.Fatalf("expected PONG, got %q", val.Str)
+	}
+
+	// Stop should close the connection
+	done := make(chan struct{})
+	go func() {
+		proxy.Stop()
+		close(done)
+	}()
+
+	// The connection should get closed, causing a read error
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, err = r.ReadValue()
+	if err == nil || err == io.EOF {
+		// Expected - connection was closed
+	}
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop() did not return in time")
 	}
 }

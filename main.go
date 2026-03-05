@@ -7,17 +7,17 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 )
 
 func main() {
 	listenAddr := flag.String("listen", envOrDefault("LISTEN", ":6379"), "Redis proxy listen address")
 	sentinelListenAddr := flag.String("sentinel-listen", envOrDefault("SENTINEL_LISTEN", ":26379"), "Sentinel emulator listen address")
-	sentinelAddr := flag.String("sentinel", envOrDefault("SENTINEL", ":26379"), "Upstream Sentinel address")
+	sentinelAddr := flag.String("sentinel", envOrDefault("SENTINEL", "127.0.0.1:26379"), "Upstream Sentinel address")
 	masterName := flag.String("master", envOrDefault("MASTER", ""), "Sentinel master name (required)")
 	auth := flag.String("auth", envOrDefault("AUTH", ""), "Password for upstream Redis master")
-	announceIP := flag.String("announce-ip", envOrDefault("ANNOUNCE_IP", ""), "IP to advertise as master (auto-detect if empty)")
+	sentinelAuth := flag.String("sentinel-auth", envOrDefault("SENTINEL_AUTH", ""), "Password for upstream Sentinel (defaults to -auth if empty)")
+	announceIP := flag.String("announce-ip", envOrDefault("ANNOUNCE_IP", ""), "IP to advertise as master (required)")
 	announcePort := flag.String("announce-port", envOrDefault("ANNOUNCE_PORT", ""), "Port to advertise as master (from -listen if empty)")
 	flag.Parse()
 
@@ -27,14 +27,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Auto-detect announce IP
-	if *announceIP == "" {
-		ip, err := detectOutboundIP()
-		if err != nil {
-			log.Fatalf("failed to auto-detect IP: %v (use -announce-ip to set manually)", err)
+	// Default sentinel auth to redis auth if not explicitly set via flag or env
+	sentinelAuthSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "sentinel-auth" {
+			sentinelAuthSet = true
 		}
-		*announceIP = ip
-		log.Printf("auto-detected announce IP: %s", ip)
+	})
+	if !sentinelAuthSet {
+		if _, ok := os.LookupEnv("SENTINEL_AUTH"); !ok {
+			*sentinelAuth = *auth
+		}
+	}
+
+	if *announceIP == "" {
+		fmt.Fprintln(os.Stderr, "error: -announce-ip flag is required")
+		flag.Usage()
+		os.Exit(1)
 	}
 
 	// Derive announce port from listen address if not specified
@@ -50,9 +59,8 @@ func main() {
 	emulator := NewSentinelEmulator(*sentinelListenAddr, *masterName, *announceIP, *announcePort)
 
 	// Create sentinel monitor with onChange callback that broadcasts to subscribers
-	monitor := NewSentinelMonitor(*sentinelAddr, *masterName, *auth, func(newMaster string) {
-		newHost, newPort, _ := net.SplitHostPort(newMaster)
-		emulator.BroadcastSwitchMaster("0.0.0.0", "0", newHost, newPort)
+	monitor := NewSentinelMonitor(*sentinelAddr, *masterName, *sentinelAuth, func(oldMaster, newMaster string) {
+		emulator.BroadcastSwitchMaster(oldMaster)
 	})
 
 	// Create redis proxy
@@ -88,18 +96,4 @@ func envOrDefault(key, defaultVal string) string {
 		return val
 	}
 	return defaultVal
-}
-
-func detectOutboundIP() (string, error) {
-	conn, err := net.Dial("udp", "8.8.8.8:53")
-	if err != nil {
-		return "", err
-	}
-	defer conn.Close()
-	addr := conn.LocalAddr().(*net.UDPAddr)
-	ip := addr.IP.String()
-	if strings.HasPrefix(ip, "127.") {
-		return "", fmt.Errorf("detected loopback address %s", ip)
-	}
-	return ip, nil
 }
